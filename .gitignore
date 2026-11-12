@@ -12,3 +12,4 @@ docs/
 main/main.c.txt
 server/server_key.pem
 server/firmware/*.bin
+main/wifi_secrets.h
