@@ -10,3 +10,4 @@ docs/
 *.bak
 .clangd
 main/main.c.txt
+server/server_key.pem
