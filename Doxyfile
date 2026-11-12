@@ -1,0 +1,13 @@
+PROJECT_NAME           = "Nodo IoT ESP32-S3"
+PROJECT_BRIEF          = "Gestion de dispositivos con IA, OTA y red nodo-edge / nodo-nodo"
+OUTPUT_DIRECTORY       = docs
+INPUT                  = main README.md
+FILE_PATTERNS          = *.c *.h *.md
+RECURSIVE              = YES
+EXTRACT_ALL            = YES
+EXTRACT_STATIC         = YES
+OPTIMIZE_OUTPUT_FOR_C  = YES
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+HAVE_DOT               = NO
+USE_MDFILE_AS_MAINPAGE = README.md
