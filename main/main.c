@@ -1,16 +1,18 @@
 /**
  * @file main.c
- * @brief Nodo IoT ESP32-S3: SHT3x + DS3231, deteccion de anomalias y OTA.
+ * @brief Nodo IoT ESP32-S3: SHT3x + DS3231, deteccion de anomalias, OTA y nodo-edge.
  *
  * Lee temperatura y humedad del sensor SHT3x por I2C, obtiene la fecha y hora
  * del reloj DS3231 y detecta anomalias termicas con un z-score sobre una
  * ventana movil, combinado con la tasa de cambio de la temperatura.
  *
- * Ademas conecta a Wi-Fi y permite actualizar el firmware por HTTPS (OTA)
- * con una pulsacion larga del boton BOOT. Si la imagen nueva no logra
- * arrancar y conectarse, el bootloader vuelve a la version anterior (rollback).
+ * Conecta a Wi-Fi, envia las lecturas al servidor edge por HTTPS y permite
+ * actualizar el firmware por HTTPS (OTA) con una pulsacion larga del boton BOOT.
+ * Si la imagen nueva no logra arrancar y conectarse, el bootloader vuelve a la
+ * version anterior (rollback).
  */
 #include <stdio.h>
+#include <string.h>
 #include <stdbool.h>
 #include <math.h>
 #include "freertos/FreeRTOS.h"
@@ -20,6 +22,8 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "ota_manager.h"
+#include "net_edge.h"
+#include "net_espnow.h"
 
 static const char *TAG = "NODE";
 
@@ -30,6 +34,7 @@ static const char *TAG = "NODE";
 #define WIN_SIZE       30
 #define Z_THRESHOLD    3.0f
 #define DTDT_THRESHOLD 1.0f   /* grados C por segundo */
+#define EDGE_PERIOD_S  5      /* Cada cuantos segundos se reporta al edge */
 
 #define PIN_BOOT_BTN   0      /* Boton BOOT de la tarjeta (GPIO0, activo en bajo) */
 #define OTA_HOLD_MS    1000   /* Pulsacion larga para disparar el OTA */
@@ -124,17 +129,30 @@ static bool detect(window_t *w, float x, float dt, float *z) {
     return alert;
 }
 
-/** @brief Tarea principal: muestrea cada 1 s y reporta alertas con la hora del RTC. */
+/**
+ * @brief Tarea principal: muestrea cada 1 s, reporta alertas con la hora del RTC
+ *        y envia lecturas al edge cada EDGE_PERIOD_S segundos (o al instante si
+ *        hay una alerta).
+ */
 static void sensor_task(void *arg) {
     window_t w = {0};
     char ts[24] = "--";
     float t, h, z;
+    int tick = 0;
     while (1) {
         if (sht_read(&t, &h) == ESP_OK) {
             bool a = detect(&w, t, 1.0f, &z);
-            rtc_read(ts, sizeof(ts));
+            if (rtc_read(ts, sizeof(ts)) != ESP_OK) strcpy(ts, "--");
             ESP_LOGI(TAG, "[%s] T=%.2f C H=%.1f %% z=%.2f", ts, t, h, z);
             if (a) ESP_LOGW(TAG, "ALERTA ANOMALIA TERMICA [%s] T=%.2f z=%.2f", ts, t, z);
+
+            if (a || ++tick >= EDGE_PERIOD_S) {
+                tick = 0;
+                edge_reading_t er = {.temp_c = t, .hum_rh = h, .z = z, .alert = a};
+                strlcpy(er.ts, ts, sizeof(er.ts));
+                net_edge_publish(&er);
+                net_espnow_send(&er);
+            }
         } else {
             ESP_LOGE(TAG, "Fallo lectura SHT3x");
         }
@@ -170,7 +188,7 @@ static void button_task(void *arg) {
 }
 
 /**
- * @brief Punto de entrada: NVS, I2C, sensores, Wi-Fi, validacion OTA y boton.
+ * @brief Punto de entrada: NVS, I2C, sensores, Wi-Fi, nodo-edge, validacion OTA y boton.
  */
 void app_main(void) {
     esp_err_t r = nvs_flash_init();
@@ -204,8 +222,10 @@ void app_main(void) {
 
     if (wifi_connect() == ESP_OK) {
         ota_mark_valid();   /* la imagen arranco y tiene red: se acepta */
+        net_edge_init();    /* desde aqui las lecturas se envian al edge */
+        net_espnow_init();  /* nodo-nodo: broadcast a los vecinos */
     } else {
-        ESP_LOGW(TAG, "Sin Wi-Fi: el OTA no estara disponible");
+        ESP_LOGW(TAG, "Sin Wi-Fi: OTA y nodo-edge no estaran disponibles");
     }
 
     xTaskCreate(button_task, "button", 8192, NULL, 4, NULL);
