@@ -1,10 +1,14 @@
 /**
  * @file main.c
- * @brief Nodo IoT ESP32-S3: lectura SHT3x + DS3231 y deteccion de anomalias.
+ * @brief Nodo IoT ESP32-S3: SHT3x + DS3231, deteccion de anomalias y OTA.
  *
  * Lee temperatura y humedad del sensor SHT3x por I2C, obtiene la fecha y hora
  * del reloj DS3231 y detecta anomalias termicas con un z-score sobre una
  * ventana movil, combinado con la tasa de cambio de la temperatura.
+ *
+ * Ademas conecta a Wi-Fi y permite actualizar el firmware por HTTPS (OTA)
+ * con una pulsacion larga del boton BOOT. Si la imagen nueva no logra
+ * arrancar y conectarse, el bootloader vuelve a la version anterior (rollback).
  */
 #include <stdio.h>
 #include <stdbool.h>
@@ -12,7 +16,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/i2c_master.h"
+#include "driver/gpio.h"
 #include "esp_log.h"
+#include "nvs_flash.h"
+#include "ota_manager.h"
 
 static const char *TAG = "NODE";
 
@@ -23,6 +30,9 @@ static const char *TAG = "NODE";
 #define WIN_SIZE       30
 #define Z_THRESHOLD    3.0f
 #define DTDT_THRESHOLD 1.0f   /* grados C por segundo */
+
+#define PIN_BOOT_BTN   0      /* Boton BOOT de la tarjeta (GPIO0, activo en bajo) */
+#define OTA_HOLD_MS    1000   /* Pulsacion larga para disparar el OTA */
 
 static i2c_master_bus_handle_t bus;
 static i2c_master_dev_handle_t sht, rtc;
@@ -117,7 +127,7 @@ static bool detect(window_t *w, float x, float dt, float *z) {
 /** @brief Tarea principal: muestrea cada 1 s y reporta alertas con la hora del RTC. */
 static void sensor_task(void *arg) {
     window_t w = {0};
-    char ts[24];
+    char ts[24] = "--";
     float t, h, z;
     while (1) {
         if (sht_read(&t, &h) == ESP_OK) {
@@ -132,8 +142,46 @@ static void sensor_task(void *arg) {
     }
 }
 
-/** @brief Punto de entrada: inicializa I2C, escanea el bus y lanza la tarea. */
+/**
+ * @brief Tarea del boton BOOT: una pulsacion larga (1 s) inicia el OTA.
+ * @param arg No se usa
+ */
+static void button_task(void *arg) {
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << PIN_BOOT_BTN,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+    gpio_config(&io);
+
+    int held_ms = 0;
+    while (1) {
+        if (gpio_get_level(PIN_BOOT_BTN) == 0) {
+            held_ms += 50;
+            if (held_ms == OTA_HOLD_MS) {
+                ESP_LOGI(TAG, "Pulsacion larga: iniciando OTA");
+                ota_perform_update();
+            }
+        } else {
+            held_ms = 0;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+/**
+ * @brief Punto de entrada: NVS, I2C, sensores, Wi-Fi, validacion OTA y boton.
+ */
 void app_main(void) {
+    esp_err_t r = nvs_flash_init();
+    if (r == ESP_ERR_NVS_NO_FREE_PAGES || r == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        r = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(r);
+
+    ota_log_version();
+
     i2c_master_bus_config_t cfg = {
         .clk_source = I2C_CLK_SRC_DEFAULT,
         .i2c_port = I2C_NUM_0,
@@ -153,4 +201,12 @@ void app_main(void) {
     d.device_address = DS3231_ADDR; ESP_ERROR_CHECK(i2c_master_bus_add_device(bus, &d, &rtc));
 
     xTaskCreate(sensor_task, "sensor", 4096, NULL, 5, NULL);
+
+    if (wifi_connect() == ESP_OK) {
+        ota_mark_valid();   /* la imagen arranco y tiene red: se acepta */
+    } else {
+        ESP_LOGW(TAG, "Sin Wi-Fi: el OTA no estara disponible");
+    }
+
+    xTaskCreate(button_task, "button", 8192, NULL, 4, NULL);
 }
